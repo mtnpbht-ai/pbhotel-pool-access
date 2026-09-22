@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -132,7 +133,22 @@ def _service_account_info() -> dict[str, Any] | None:
             data = json.loads(local_file.read_text(encoding="utf-8"))
             return _normalise_private_key(data)
 
-    # Optional environment deployment.
+    # Streamlit Cloud / environment deployment using one-line Base64.
+    # This avoids TOML multiline/private-key formatting issues.
+    raw_b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64", "").strip()
+    if not raw_b64:
+        try:
+            raw_b64 = clean_text(st.secrets.get("GOOGLE_SERVICE_ACCOUNT_B64", ""))
+        except Exception:
+            raw_b64 = ""
+    if raw_b64:
+        try:
+            decoded = base64.b64decode(raw_b64).decode("utf-8")
+            return _normalise_private_key(json.loads(decoded))
+        except Exception as exc:
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_B64 tidak sah.") from exc
+
+    # Optional environment deployment using raw JSON.
     raw_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if raw_env:
         return _normalise_private_key(json.loads(raw_env))
