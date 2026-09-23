@@ -41,6 +41,9 @@ DEFAULT_CONFIG = {
     "MAX_TOWEL_PER_ENTRY": "2",
 }
 
+# Locked operating rule: maximum 2 pool towels per room for each session.
+MAX_TOWELS_PER_ROOM_SESSION = 2
+
 ACTIVE_PMS_PRIORITIES = {
     "INHOUSE",
     "STAY OVER",
@@ -415,16 +418,58 @@ def pms_room_is_active(row: dict[str, str] | None) -> bool:
 # =========================================================
 # TRAFFIC LOG / DUPLICATE CONTROL
 # =========================================================
-def room_already_registered(room_no: str, work_date: str, session: str) -> bool:
+def _safe_int(value: Any) -> int:
+    try:
+        return int(float(clean_text(value) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def room_session_summary(room_no: str, work_date: str, session: str) -> dict[str, Any]:
+    """Return cumulative users and towels for one room in one pool session."""
     ws = worksheet(TRAFFIC_SHEET_ID, TRAFFIC_LOG_SHEET)
+    matched: list[dict[str, str]] = []
+
     for row in rows_as_dicts(ws):
         if (
             normalise_room(row.get("ROOM_NO")) == room_no
             and clean_text(row.get("WORK_DATE")) == work_date
             and upper(row.get("SESSION")) == session
         ):
-            return True
-    return False
+            matched.append(row)
+
+    if not matched:
+        return {
+            "exists": False,
+            "adult": 0,
+            "children": 0,
+            "total_guest": 0,
+            "towels": 0,
+            "primary": {},
+        }
+
+    # The base registration keeps the original verification/PMS audit fields.
+    primary = next(
+        (
+            row for row in matched
+            if upper(row.get("VERIFY_STATUS")) in {"VERIFIED", "NON RECORDED"}
+            and upper(row.get("SOURCE")) == "PUBLIC QR"
+        ),
+        matched[0],
+    )
+
+    return {
+        "exists": True,
+        "adult": sum(_safe_int(row.get("ADULT")) for row in matched),
+        "children": sum(_safe_int(row.get("CHILDREN")) for row in matched),
+        "total_guest": sum(_safe_int(row.get("TOTAL_GUEST")) for row in matched),
+        "towels": sum(_safe_int(row.get("TOWEL_QTY")) for row in matched),
+        "primary": primary,
+    }
+
+
+def room_already_registered(room_no: str, work_date: str, session: str) -> bool:
+    return bool(room_session_summary(room_no, work_date, session).get("exists"))
 
 
 def save_verified(
@@ -460,6 +505,43 @@ def save_verified(
         "PMS_SOURCE": pms_source,
         "PMS_SNAPSHOT_ID": clean_text(pms_snapshot.get("snapshot_id")),
         "PMS_VERIFIED_AT": timestamp_text(now),
+    }
+    append_record(worksheet(TRAFFIC_SHEET_ID, TRAFFIC_LOG_SHEET), record)
+    return traffic_id
+
+
+def save_session_update(
+    *,
+    room_no: str,
+    adult: int,
+    children: int,
+    towel_qty: int,
+    session: str,
+    base_registration: dict[str, str],
+) -> str:
+    """Append new users/towels to an existing room session without duplicating the base visit."""
+    now = now_local()
+    traffic_id = new_id("POOLUPD")
+    record = {
+        "TRAFFIC_ID": traffic_id,
+        "TIMESTAMP": timestamp_text(now),
+        "WORK_DATE": now.strftime("%Y-%m-%d"),
+        "SESSION": session,
+        "ROOM_NO": room_no,
+        "GUEST_NAME": "",
+        "ADULT": adult,
+        "CHILDREN": children,
+        "TOTAL_GUEST": adult + children,
+        "TOWEL_QTY": towel_qty,
+        # Keep verification KPIs based on the original registration only.
+        "VERIFY_STATUS": "SESSION_UPDATE",
+        "PMS_LAST_UPDATED": clean_text(base_registration.get("PMS_LAST_UPDATED")),
+        "PMS_MATCH_PRIORITY": clean_text(base_registration.get("PMS_MATCH_PRIORITY")),
+        "SOURCE": "PUBLIC_QR_SESSION_UPDATE",
+        "REMARKS": "Additional users/towels for existing room session; base registration not duplicated.",
+        "PMS_SOURCE": clean_text(base_registration.get("PMS_SOURCE")),
+        "PMS_SNAPSHOT_ID": clean_text(base_registration.get("PMS_SNAPSHOT_ID")),
+        "PMS_VERIFIED_AT": clean_text(base_registration.get("PMS_VERIFIED_AT")),
     }
     append_record(worksheet(TRAFFIC_SHEET_ID, TRAFFIC_LOG_SHEET), record)
     return traffic_id
@@ -642,6 +724,168 @@ if isinstance(success_data, dict):
         st.rerun()
     st.stop()
 
+update_success = st.session_state.get("pool_update_success")
+if isinstance(update_success, dict):
+    st.markdown("### ✅ Pool Session Updated")
+    st.success(
+        f"Room {update_success.get('room', '')} · "
+        f"{str(update_success.get('session', '')).title()} Session"
+    )
+    st.write(
+        f"**Session users:** {update_success.get('total_guest', 0)}  ·  "
+        f"**Towels:** {update_success.get('towels', 0)}/{MAX_TOWELS_PER_ROOM_SESSION}"
+    )
+    st.caption("Only newly joined users were added. The original room registration was not duplicated.")
+    if st.button("Register another room", key="pool_update_next", width="stretch"):
+        st.session_state.pop("pool_update_success", None)
+        st.rerun()
+    st.stop()
+
+
+existing_session = st.session_state.get("pool_existing_session")
+if isinstance(existing_session, dict):
+    existing_room = normalise_room(existing_session.get("room"))
+    existing_work_date = clean_text(existing_session.get("work_date"))
+    existing_session_name = upper(existing_session.get("session"))
+
+    try:
+        current_config = load_config()
+        live_session, _ = current_session(now_local(), current_config)
+        fresh = room_session_summary(existing_room, existing_work_date, existing_session_name)
+    except Exception:
+        st.error("Current room session could not be loaded. Please see the Pool Attendant.")
+        st.stop()
+
+    if not fresh.get("exists"):
+        st.session_state.pop("pool_existing_session", None)
+        st.warning("The earlier room registration could not be found. Please register again.")
+        st.rerun()
+
+    current_adult = _safe_int(fresh.get("adult"))
+    current_children = _safe_int(fresh.get("children"))
+    current_guests = _safe_int(fresh.get("total_guest"))
+    current_towels = _safe_int(fresh.get("towels"))
+    remaining_towels = max(0, MAX_TOWELS_PER_ROOM_SESSION - current_towels)
+    suggested_adult = max(0, min(_safe_int(existing_session.get("suggested_adult")), 6))
+    suggested_children = max(0, min(_safe_int(existing_session.get("suggested_children")), 6))
+    suggested_towel = max(0, _safe_int(existing_session.get("suggested_towel")))
+
+    st.markdown(f"### Room {existing_room} · {existing_session_name.title()} Session")
+    st.info("This room is already registered for the current session.")
+    st.write(
+        f"**Users recorded:** {current_guests} "
+        f"(Adult {current_adult} · Children {current_children})"
+    )
+    st.write(
+        f"**Pool towels:** {current_towels}/{MAX_TOWELS_PER_ROOM_SESSION}"
+    )
+    st.caption(
+        "If NEW users from this room join later in the same session, add only those new users below. "
+        "Do not add people who were already counted earlier."
+    )
+
+    if live_session != existing_session_name:
+        st.warning("This session is no longer active. A new session must use a new registration.")
+        if st.button("← Back", key="existing_session_closed_back", width="stretch"):
+            st.session_state.pop("pool_existing_session", None)
+            st.rerun()
+        st.stop()
+
+    with st.form("pool_existing_session_update", clear_on_submit=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            add_adult = st.selectbox(
+                "New Adult",
+                list(range(0, 7)),
+                index=suggested_adult,
+            )
+        with c2:
+            add_children = st.selectbox(
+                "New Children",
+                list(range(0, 7)),
+                index=suggested_children,
+            )
+
+        if remaining_towels > 0:
+            towel_options = list(range(0, remaining_towels + 1))
+            towel_index = min(suggested_towel, remaining_towels)
+            add_towel = st.selectbox(
+                "Additional Pool Towel",
+                towel_options,
+                index=towel_index,
+                help=(
+                    f"Room {existing_room} has {remaining_towels} towel allowance remaining "
+                    f"for this session. Maximum is {MAX_TOWELS_PER_ROOM_SESSION}."
+                ),
+            )
+        else:
+            add_towel = 0
+            st.warning(
+                f"Towel limit reached: {current_towels}/{MAX_TOWELS_PER_ROOM_SESSION}. "
+                "No additional towel can be issued in this session."
+            )
+
+        confirm_new_users = st.checkbox(
+            "I confirm any guest numbers added above are NEW users not previously counted.",
+            value=False,
+        )
+        update_submit = st.form_submit_button(
+            "UPDATE THIS SESSION",
+            type="primary",
+            width="stretch",
+        )
+
+    if update_submit:
+        add_adult = int(add_adult)
+        add_children = int(add_children)
+        add_towel = int(add_towel)
+        add_guests = add_adult + add_children
+
+        if add_guests <= 0 and add_towel <= 0:
+            st.info("No new users or towels were added. Existing counts remain unchanged.")
+        elif add_guests > 0 and not confirm_new_users:
+            st.error("Please confirm that the guest numbers are NEW users for this session.")
+        else:
+            try:
+                # Re-read before append so two phones cannot push towels above 2.
+                latest = room_session_summary(existing_room, existing_work_date, existing_session_name)
+                latest_towels = _safe_int(latest.get("towels"))
+                latest_remaining = max(0, MAX_TOWELS_PER_ROOM_SESSION - latest_towels)
+
+                if add_towel > latest_remaining:
+                    st.error(
+                        f"Only {latest_remaining} towel(s) remain for this room in the current session."
+                    )
+                    st.stop()
+
+                save_session_update(
+                    room_no=existing_room,
+                    adult=add_adult,
+                    children=add_children,
+                    towel_qty=add_towel,
+                    session=existing_session_name,
+                    base_registration=dict(latest.get("primary") or {}),
+                )
+
+                final_guest = _safe_int(latest.get("total_guest")) + add_guests
+                final_towels = latest_towels + add_towel
+                st.session_state.pop("pool_existing_session", None)
+                st.session_state["pool_update_success"] = {
+                    "room": existing_room,
+                    "session": existing_session_name,
+                    "total_guest": final_guest,
+                    "towels": final_towels,
+                }
+                st.rerun()
+            except Exception:
+                st.error("Session update could not be saved. Please see the Pool Attendant.")
+
+    if st.button("← Back", key="existing_session_back", width="stretch"):
+        st.session_state.pop("pool_existing_session", None)
+        st.rerun()
+    st.stop()
+
+
 pending = st.session_state.get("pool_pending_nonrecorded")
 if isinstance(pending, dict):
     st.warning("Room verification is not available. Please enter the guest name to continue.")
@@ -673,10 +917,18 @@ if isinstance(pending, dict):
                     st.error("Pool registration session has ended. Please see the Pool Attendant.")
                     st.stop()
 
-                if room_already_registered(pending["room_no"], work_date, live_session):
+                existing = room_session_summary(pending["room_no"], work_date, live_session)
+                if existing.get("exists"):
                     st.session_state.pop("pool_pending_nonrecorded", None)
-                    st.info("This room has already been registered for the current session.")
-                    st.stop()
+                    st.session_state["pool_existing_session"] = {
+                        "room": pending["room_no"],
+                        "work_date": work_date,
+                        "session": live_session,
+                        "suggested_adult": int(pending["adult"]),
+                        "suggested_children": int(pending["children"]),
+                        "suggested_towel": int(pending["towel_qty"]),
+                    }
+                    st.rerun()
 
                 alert_hours = int(float(current_config.get("ALERT_HOURS", "3") or 3))
                 save_non_recorded(
@@ -706,10 +958,12 @@ if isinstance(pending, dict):
     st.stop()
 
 st.markdown("### Register your visit")
-st.caption("Please complete one registration per room for each pool session.")
+st.caption(
+    "One base registration per room per pool session. If NEW users join later, "
+    "scan again and add only the new users. Maximum 2 pool towels per room per session."
+)
 
-max_towel = int(float(config.get("MAX_TOWEL_PER_ENTRY", "2") or 2))
-max_towel = max(0, min(max_towel, 10))
+max_towel = MAX_TOWELS_PER_ROOM_SESSION
 
 with st.form("pool_guest_registration", clear_on_submit=False):
     room_number = st.text_input(
@@ -760,9 +1014,17 @@ if submit:
                 st.stop()
 
             work_date = current_now.strftime("%Y-%m-%d")
-            if room_already_registered(room_no, work_date, live_session):
-                st.info("This room has already been registered for the current session. No second registration is required.")
-                st.stop()
+            existing = room_session_summary(room_no, work_date, live_session)
+            if existing.get("exists"):
+                st.session_state["pool_existing_session"] = {
+                    "room": room_no,
+                    "work_date": work_date,
+                    "session": live_session,
+                    "suggested_adult": adult,
+                    "suggested_children": children,
+                    "suggested_towel": towel_qty,
+                }
+                st.rerun()
 
             # Guest sees no extra step. Backend chooses the best PMS reference:
             # today's Pool PMS first; otherwise today's locked HK allocation.
